@@ -19,8 +19,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
-from timm.data.mixup import Mixup
-from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
+import torch.nn as nn
 from timm.models import create_model
 from timm.utils import ModelEma
 
@@ -40,6 +39,102 @@ from optim_factory import (
 )
 from utils import NativeScalerWithGradNormCount as NativeScaler
 from utils import multiple_samples_collate
+
+from reid.reid_head import ReIDHead
+from reid.reid_losses import CombinedLoss
+
+
+class VideoMAEReID(nn.Module):
+
+    def __init__(self, backbone, num_classes, embed_dim=512, neck_feat='after'):
+        super().__init__()
+        self.backbone = backbone
+        in_dim = getattr(self.backbone, 'num_features', None)
+        if in_dim is None:
+            in_dim = getattr(self.backbone, 'embed_dim')
+        self.reid_head = ReIDHead(
+            in_dim=in_dim,
+            num_classes=num_classes,
+            embed_dim=embed_dim,
+            neck_feat=neck_feat)
+
+    def forward(self, x):
+        features = self.backbone.forward_features(x)
+        if self.training:
+            cls_score, global_feat, feat = self.reid_head(features)
+            return {
+                'cls_score': cls_score,
+                'global_feat': global_feat,
+                'feat': feat
+            }
+        return self.reid_head(features)
+
+    def no_weight_decay(self):
+        if hasattr(self.backbone, 'no_weight_decay'):
+            return self.backbone.no_weight_decay()
+        return set()
+
+    def get_num_layers(self):
+        if hasattr(self.backbone, 'get_num_layers'):
+            return self.backbone.get_num_layers()
+        raise AttributeError('Backbone does not implement get_num_layers')
+
+
+def save_training_curves(output_dir,
+                         train_epochs,
+                         train_loss_history,
+                         val_epochs,
+                         val_rank1_history,
+                         val_rank5_history,
+                         val_mAP_history):
+    if not train_epochs or not train_loss_history:
+        return
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("Matplotlib is not available. Skipping curve plotting.")
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    has_val = bool(val_epochs and val_rank1_history)
+    n_rows = 2 if has_val else 1
+    fig, axes = plt.subplots(n_rows, 1, figsize=(8, 4 * n_rows), sharex=True)
+    if n_rows == 1:
+        axes = [axes]
+
+    axes[0].plot(train_epochs, train_loss_history, marker='o', label='Train Loss')
+    axes[0].set_ylabel('Loss')
+    axes[0].set_title('Training Loss over Epochs')
+    axes[0].grid(True, linestyle='--', alpha=0.4)
+    axes[0].legend()
+
+    if has_val:
+        axes[1].plot(val_epochs,
+                     [v * 100 for v in val_rank1_history],
+                     marker='o',
+                     label='Rank-1')
+        if val_rank5_history:
+            axes[1].plot(val_epochs,
+                         [v * 100 for v in val_rank5_history],
+                         marker='s',
+                         label='Rank-5')
+        if val_mAP_history:
+            axes[1].plot(val_epochs,
+                         [v * 100 for v in val_mAP_history],
+                         marker='^',
+                         label='mAP')
+        axes[1].set_ylabel('Metric (%)')
+        axes[1].set_title('Validation Metrics over Epochs')
+        axes[1].grid(True, linestyle='--', alpha=0.4)
+        axes[1].legend()
+
+    axes[-1].set_xlabel('Epoch')
+    fig.tight_layout()
+    plot_path = os.path.join(output_dir, 'training_curves.png')
+    fig.savefig(plot_path)
+    plt.close(fig)
+    print(f"Saved training curves to {plot_path}")
 
 
 def get_args():
@@ -187,7 +282,7 @@ def get_args():
         metavar='PCT',
         help='Color jitter factor (default: 0.4)')
     parser.add_argument(
-        '--num_sample', type=int, default=2, help='Repeated_aug (default: 2)')
+        '--num_sample', type=int, default=1, help='Repeated_aug (default: 1)')
     parser.add_argument(
         '--aa',
         type=str,
@@ -242,12 +337,12 @@ def get_args():
     parser.add_argument(
         '--mixup',
         type=float,
-        default=0.8,
-        help='mixup alpha, mixup enabled if > 0.')
+        default=0.0,
+        help='mixup alpha, mixup enabled if > 0. (default: disabled)')
     parser.add_argument(
         '--cutmix',
         type=float,
-        default=1.0,
+        default=0.0,
         help='cutmix alpha, cutmix enabled if > 0.')
     parser.add_argument(
         '--cutmix_minmax',
@@ -258,14 +353,12 @@ def get_args():
     parser.add_argument(
         '--mixup_prob',
         type=float,
-        default=1.0,
-        help=
-        'Probability of performing mixup or cutmix when either/both is enabled'
-    )
+        default=0.0,
+        help='Probability of performing mixup or cutmix when enabled')
     parser.add_argument(
         '--mixup_switch_prob',
         type=float,
-        default=0.5,
+        default=0.0,
         help=
         'Probability of switching to cutmix when both mixup and cutmix enabled'
     )
@@ -330,6 +423,15 @@ def get_args():
         default=1,
         type=int,
         help='start_idx for rwaframe dataset')
+
+    # ReID specific parameters
+    parser.add_argument('--reid_embed_dim', type=int, default=512)
+    parser.add_argument('--reid_neck_feat', type=str, default='after',
+                        choices=['after', 'before'])
+    parser.add_argument('--id_loss_weight', type=float, default=1.0)
+    parser.add_argument('--triplet_loss_weight', type=float, default=1.0)
+    parser.add_argument('--triplet_margin', type=float, default=0.3)
+    parser.add_argument('--use_triplet', action='store_true', default=True)
 
     parser.add_argument(
         '--output_dir',
@@ -442,21 +544,7 @@ def main(args):
     else:
         data_loader_test = None
 
-    mixup_fn = None
-    mixup_active = args.mixup > 0 or args.cutmix > 0. or args.cutmix_minmax is not None
-    if mixup_active:
-        print("Mixup is activated!")
-        mixup_fn = Mixup(
-            mixup_alpha=args.mixup,
-            cutmix_alpha=args.cutmix,
-            cutmix_minmax=args.cutmix_minmax,
-            prob=args.mixup_prob,
-            switch_prob=args.mixup_switch_prob,
-            mode=args.mixup_mode,
-            label_smoothing=args.smoothing,
-            num_classes=args.nb_classes)
-
-    model = create_model(
+    backbone = create_model(
         args.model,
         img_size=args.input_size,
         pretrained=False,
@@ -473,7 +561,10 @@ def main(args):
         with_cp=args.with_checkpoint,
     )
 
-    patch_size = model.patch_embed.patch_size
+    if hasattr(backbone, 'reset_classifier'):
+        backbone.reset_classifier(0)
+
+    patch_size = backbone.patch_embed.patch_size
     print("Patch size = %s" % str(patch_size))
 
     args.window_size = (args.num_frames // args.tubelet_size,
@@ -503,10 +594,15 @@ def main(args):
                 new_key = old_key[10:]
                 checkpoint_model[new_key] = checkpoint_model.pop(old_key)
 
-        state_dict = model.state_dict()
+        state_dict = backbone.state_dict()
         for k in ['head.weight', 'head.bias']:
-            if k in checkpoint_model and checkpoint_model[
-                    k].shape != state_dict[k].shape:
+            if k not in checkpoint_model:
+                continue
+            if k not in state_dict:
+                print(f"Removing key {k} from pretrained checkpoint (not in backbone)")
+                del checkpoint_model[k]
+                continue
+            if checkpoint_model[k].shape != state_dict[k].shape:
                 if checkpoint_model[k].shape[
                         0] == 710 and args.data_set.startswith('Kinetics'):
                     print(f'Convert K710 head to {args.data_set} head')
@@ -538,17 +634,17 @@ def main(args):
         if 'pos_embed' in checkpoint_model:
             pos_embed_checkpoint = checkpoint_model['pos_embed']
             embedding_size = pos_embed_checkpoint.shape[-1]  # channel dim
-            num_patches = model.patch_embed.num_patches  #
-            num_extra_tokens = model.pos_embed.shape[-2] - num_patches  # 0/1
+            num_patches = backbone.patch_embed.num_patches  #
+            num_extra_tokens = backbone.pos_embed.shape[-2] - num_patches  # 0/1
 
             # height (== width) for the checkpoint position embedding
             orig_size = int(
                 ((pos_embed_checkpoint.shape[-2] - num_extra_tokens) //
-                 (args.num_frames // model.patch_embed.tubelet_size))**0.5)
+                 (args.num_frames // backbone.patch_embed.tubelet_size))**0.5)
             # height (== width) for the new position embedding
             new_size = int(
                 (num_patches //
-                 (args.num_frames // model.patch_embed.tubelet_size))**0.5)
+                 (args.num_frames // backbone.patch_embed.tubelet_size))**0.5)
             # class_token and dist_token are kept unchanged
             if orig_size != new_size:
                 print("Position interpolate from %dx%d to %dx%d" %
@@ -558,7 +654,7 @@ def main(args):
                 pos_tokens = pos_embed_checkpoint[:, num_extra_tokens:]
                 # B, L, C -> BT, H, W, C -> BT, C, H, W
                 pos_tokens = pos_tokens.reshape(
-                    -1, args.num_frames // model.patch_embed.tubelet_size,
+                    -1, args.num_frames // backbone.patch_embed.tubelet_size,
                     orig_size, orig_size, embedding_size)
                 pos_tokens = pos_tokens.reshape(-1, orig_size, orig_size,
                                                 embedding_size).permute(
@@ -570,13 +666,13 @@ def main(args):
                     align_corners=False)
                 # BT, C, H, W -> BT, H, W, C ->  B, T, H, W, C
                 pos_tokens = pos_tokens.permute(0, 2, 3, 1).reshape(
-                    -1, args.num_frames // model.patch_embed.tubelet_size,
+                    -1, args.num_frames // backbone.patch_embed.tubelet_size,
                     new_size, new_size, embedding_size)
                 pos_tokens = pos_tokens.flatten(1, 3)  # B, L, C
                 new_pos_embed = torch.cat((extra_tokens, pos_tokens), dim=1)
                 checkpoint_model['pos_embed'] = new_pos_embed
         elif args.input_size != 224:
-            pos_tokens = model.pos_embed
+            pos_tokens = backbone.pos_embed
             org_num_frames = 16
             T = org_num_frames // args.tubelet_size
             P = int((pos_tokens.shape[1] // T)**0.5)
@@ -594,11 +690,11 @@ def main(args):
             pos_tokens = pos_tokens.permute(0, 2, 3,
                                             1).reshape(-1, T, new_P, new_P, C)
             pos_tokens = pos_tokens.flatten(1, 3)  # B, L, C
-            model.pos_embed = pos_tokens  # update
+            backbone.pos_embed = pos_tokens  # update
         if args.num_frames != 16:
             org_num_frames = 16
             T = org_num_frames // args.tubelet_size
-            pos_tokens = model.pos_embed
+            pos_tokens = backbone.pos_embed
             new_T = args.num_frames // args.tubelet_size
             P = int((pos_tokens.shape[1] // T)**0.5)
             C = pos_tokens.shape[2]
@@ -610,10 +706,16 @@ def main(args):
             pos_tokens = pos_tokens.reshape(1, P, P, C,
                                             new_T).permute(0, 4, 1, 2, 3)
             pos_tokens = pos_tokens.flatten(1, 3)
-            model.pos_embed = pos_tokens  # update
+            backbone.pos_embed = pos_tokens  # update
 
         utils.load_state_dict(
-            model, checkpoint_model, prefix=args.model_prefix)
+            backbone, checkpoint_model, prefix=args.model_prefix)
+
+    model = VideoMAEReID(
+        backbone,
+        num_classes=args.nb_classes,
+        embed_dim=args.reid_embed_dim,
+        neck_feat=args.reid_neck_feat)
 
     model.to(device)
 
@@ -690,15 +792,15 @@ def main(args):
     print("Max WD = %.7f, Min WD = %.7f" %
           (max(wd_schedule_values), min(wd_schedule_values)))
 
-    if mixup_fn is not None:
-        # smoothing is handled with mixup label transform
-        criterion = SoftTargetCrossEntropy()
-    elif args.smoothing > 0.:
-        criterion = LabelSmoothingCrossEntropy(smoothing=args.smoothing)
-    else:
-        criterion = torch.nn.CrossEntropyLoss()
+    criterion = CombinedLoss(
+        num_classes=args.nb_classes,
+        label_smooth_epsilon=args.smoothing,
+        use_triplet=args.use_triplet,
+        triplet_margin=args.triplet_margin,
+        id_weight=args.id_loss_weight,
+        triplet_weight=args.triplet_loss_weight)
 
-    print("criterion = %s" % str(criterion))
+    print("Using CombinedLoss for ReID training")
 
     utils.auto_load_model(
         args=args,
@@ -710,21 +812,23 @@ def main(args):
     if args.validation:
         test_stats = validation_one_epoch(data_loader_val, model, device)
         print(
-            f"{len(dataset_val)} val images: Top-1 {test_stats['acc1']:.2f}%, Top-5 {test_stats['acc5']:.2f}%, loss {test_stats['loss']:.4f}"
+            f"{len(dataset_val)} val samples: Rank-1 {test_stats['rank1'] * 100:.2f}%, "
+            f"Rank-5 {test_stats['rank5'] * 100:.2f}%, mAP {test_stats['mAP'] * 100:.2f}%"
         )
         exit(0)
 
     if args.eval:
         if data_loader_test is None:
             raise RuntimeError('Test dataloader is not initialized.')
-        preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
-        test_stats = final_test(data_loader_test, model, device, preds_file)
+        test_stats = final_test(data_loader_test, model, device)
         print(
-            f"Accuracy of the network on the {len(dataset_test)} test videos: Top-1: {test_stats['acc1']:.2f}%, Top-5: {test_stats['acc5']:.2f}%"
+            f"ReID metrics on {len(dataset_test)} test videos: Rank-1 {test_stats['rank1'] * 100:.2f}%, "
+            f"Rank-5 {test_stats['rank5'] * 100:.2f}%, mAP {test_stats['mAP'] * 100:.2f}%"
         )
         log_stats = {
-            'Final top-1': test_stats['acc1'],
-            'Final Top-5': test_stats['acc5']
+            'Final Rank-1': test_stats['rank1'],
+            'Final Rank-5': test_stats['rank5'],
+            'Final mAP': test_stats['mAP']
         }
         if args.output_dir and utils.is_main_process():
             with open(
@@ -736,7 +840,13 @@ def main(args):
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
-    max_accuracy = 0.0
+    best_rank1 = 0.0
+    train_epochs = []
+    train_loss_history = []
+    val_epochs = []
+    val_rank1_history = []
+    val_rank5_history = []
+    val_mAP_history = []
     for epoch in range(args.start_epoch, args.epochs):
         if log_writer is not None:
             log_writer.set_step(epoch * num_training_steps_per_epoch *
@@ -751,7 +861,6 @@ def main(args):
             loss_scaler,
             args.clip_grad,
             model_ema,
-            mixup_fn,
             log_writer=log_writer,
             start_steps=epoch * num_training_steps_per_epoch,
             lr_schedule_values=lr_schedule_values,
@@ -759,6 +868,11 @@ def main(args):
             num_training_steps_per_epoch=num_training_steps_per_epoch,
             update_freq=args.update_freq,
         )
+        train_epochs.append(epoch + 1)
+        if 'loss' in train_stats and train_stats['loss'] is not None:
+            train_loss_history.append(train_stats['loss'])
+        else:
+            train_loss_history.append(0.0)
         if args.output_dir and args.save_ckpt:
             _epoch = epoch + 1
             if _epoch % args.save_ckpt_freq == 0 or _epoch == args.epochs:
@@ -772,11 +886,18 @@ def main(args):
                     model_ema=model_ema)
         if data_loader_val is not None:
             test_stats = validation_one_epoch(data_loader_val, model, device)
+            current_rank1 = test_stats['rank1'] * 100
+            current_rank5 = test_stats['rank5'] * 100
+            val_epochs.append(epoch + 1)
+            val_rank1_history.append(test_stats['rank1'])
+            val_rank5_history.append(test_stats['rank5'])
+            val_mAP_history.append(test_stats['mAP'])
             print(
-                f"Accuracy of the network on the {len(dataset_val)} val images: {test_stats['acc1']:.2f}%"
+                f"Metrics on {len(dataset_val)} val samples -> Rank-1 {current_rank1:.2f}%, "
+                f"Rank-5 {current_rank5:.2f}%, mAP {test_stats['mAP'] * 100:.2f}%"
             )
-            if max_accuracy < test_stats["acc1"]:
-                max_accuracy = test_stats["acc1"]
+            if best_rank1 < current_rank1:
+                best_rank1 = current_rank1
                 if args.output_dir and args.save_ckpt:
                     utils.save_model(
                         args=args,
@@ -787,14 +908,14 @@ def main(args):
                         epoch="best",
                         model_ema=model_ema)
 
-            print(f'Max accuracy: {max_accuracy:.2f}%')
+            print(f'Best Rank-1: {best_rank1:.2f}%')
             if log_writer is not None:
                 log_writer.update(
-                    val_acc1=test_stats['acc1'], head="perf", step=epoch)
+                    val_rank1=test_stats['rank1'], head="perf", step=epoch)
                 log_writer.update(
-                    val_acc5=test_stats['acc5'], head="perf", step=epoch)
+                    val_rank5=test_stats['rank5'], head="perf", step=epoch)
                 log_writer.update(
-                    val_loss=test_stats['loss'], head="perf", step=epoch)
+                    val_mAP=test_stats['mAP'], head="perf", step=epoch)
 
             log_stats = {
                 **{f'train_{k}': v
@@ -819,20 +940,27 @@ def main(args):
                 f.write(json.dumps(log_stats) + "\n")
 
     if data_loader_test is not None:
-        preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
-        test_stats = final_test(data_loader_test, model, device, preds_file)
-        final_top1 = test_stats['acc1']
-        final_top5 = test_stats['acc5']
+        test_stats = final_test(data_loader_test, model, device)
         print(
-            f"Accuracy of the network on the {len(dataset_test)} test videos: Top-1: {final_top1:.2f}%, Top-5: {final_top5:.2f}%"
+            f"ReID metrics on the {len(dataset_test)} test videos: Rank-1 {test_stats['rank1'] * 100:.2f}%, "
+            f"Rank-5 {test_stats['rank5'] * 100:.2f}%, mAP {test_stats['mAP'] * 100:.2f}%"
         )
-        log_stats = {'Final top-1': final_top1, 'Final Top-5': final_top5}
+        log_stats = {
+            'Final Rank-1': test_stats['rank1'],
+            'Final Rank-5': test_stats['rank5'],
+            'Final mAP': test_stats['mAP']
+        }
         if args.output_dir and utils.is_main_process():
             with open(
                     os.path.join(args.output_dir, "log.txt"),
                     mode="a",
                     encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
+
+    if args.output_dir and utils.is_main_process():
+        save_training_curves(args.output_dir, train_epochs, train_loss_history,
+                             val_epochs, val_rank1_history, val_rank5_history,
+                             val_mAP_history)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))

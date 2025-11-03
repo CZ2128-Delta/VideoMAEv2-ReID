@@ -37,5 +37,10 @@ python run_class_finetuning.py \
     --opt adamw \
     --lr 2e-4 \
     --warmup_epochs 0 \
-    --epochs 30 \
-    --num_sample 1
+    --epochs 50 \
+    --reid_embed_dim 512 \
+    --reid_neck_feat after \
+    --id_loss_weight 1.0 \
+    --triplet_loss_weight 1.0 \
+    --triplet_margin 0.3 \
+    --use_triplet
