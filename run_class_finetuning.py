@@ -16,7 +16,6 @@ from collections import OrderedDict
 from functools import partial
 from pathlib import Path
 
-import deepspeed
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
@@ -31,7 +30,6 @@ import utils
 from dataset import build_dataset
 from engine_for_finetuning import (
     final_test,
-    merge,
     train_one_epoch,
     validation_one_epoch,
 )
@@ -318,7 +316,7 @@ def get_args():
         default='Kinetics-400',
         choices=[
             'Kinetics-400', 'Kinetics-600', 'Kinetics-700', 'SSV2', 'UCF101',
-            'HMDB51', 'Diving48', 'Kinetics-710', 'MIT'
+            'HMDB51', 'Diving48', 'Kinetics-710', 'MIT', 'custom'
         ],
         type=str,
         help='dataset')
@@ -361,11 +359,6 @@ def get_args():
         '--eval', action='store_true', help='Perform evaluation only')
     parser.add_argument(
         '--validation', action='store_true', help='Perform validation only')
-    parser.add_argument(
-        '--dist_eval',
-        action='store_true',
-        default=False,
-        help='Enabling distributed evaluation')
     parser.add_argument('--num_workers', default=10, type=int)
     parser.add_argument(
         '--pin_mem',
@@ -376,39 +369,11 @@ def get_args():
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
     parser.set_defaults(pin_mem=True)
 
-    # distributed training parameters
-    parser.add_argument(
-        '--world_size',
-        default=1,
-        type=int,
-        help='number of distributed processes')
-    parser.add_argument('--local_rank', default=-1, type=int)
-    parser.add_argument('--dist_on_itp', action='store_true')
-    parser.add_argument(
-        '--dist_url',
-        default='env://',
-        help='url used to set up distributed training')
-
-    parser.add_argument(
-        '--enable_deepspeed', action='store_true', default=False)
-
-    known_args, _ = parser.parse_known_args()
-
-    if known_args.enable_deepspeed:
-        parser = deepspeed.add_config_arguments(parser)
-        ds_init = deepspeed.initialize
-    else:
-        ds_init = None
-
-    return parser.parse_args(), ds_init
+    # Single-GPU training configuration
+    return parser.parse_args()
 
 
-def main(args, ds_init):
-    utils.init_distributed_mode(args)
-
-    if ds_init is not None:
-        utils.create_ds_config(args)
-
+def main(args):
     print(args)
 
     device = torch.device(args.device)
@@ -431,29 +396,8 @@ def main(args, ds_init):
 
     num_tasks = utils.get_world_size()
     global_rank = utils.get_rank()
-    sampler_train = torch.utils.data.DistributedSampler(
-        dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True)
-    print("Sampler_train = %s" % str(sampler_train))
-    if args.dist_eval:
-        if len(dataset_val) % num_tasks != 0:
-            print(
-                'Warning: Enabling distributed evaluation with an eval dataset not divisible by process number. '
-                'This will slightly alter validation results as extra duplicate entries are added to achieve '
-                'equal num of samples per-process.')
-        sampler_val = torch.utils.data.DistributedSampler(
-            dataset_val,
-            num_replicas=num_tasks,
-            rank=global_rank,
-            shuffle=False)
-        sampler_test = torch.utils.data.DistributedSampler(
-            dataset_test,
-            num_replicas=num_tasks,
-            rank=global_rank,
-            shuffle=False)
-    else:
-        sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
-    if global_rank == 0 and args.log_dir is not None:
+    if args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
         log_writer = utils.TensorboardLogger(log_dir=args.log_dir)
     else:
@@ -466,8 +410,8 @@ def main(args, ds_init):
 
     data_loader_train = torch.utils.data.DataLoader(
         dataset_train,
-        sampler=sampler_train,
         batch_size=args.batch_size,
+        shuffle=True,
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
         drop_last=True,
@@ -477,8 +421,8 @@ def main(args, ds_init):
     if dataset_val is not None:
         data_loader_val = torch.utils.data.DataLoader(
             dataset_val,
-            sampler=sampler_val,
             batch_size=int(1.5 * args.batch_size),
+            shuffle=False,
             num_workers=args.num_workers,
             pin_memory=args.pin_mem,
             drop_last=False,
@@ -489,8 +433,8 @@ def main(args, ds_init):
     if dataset_test is not None:
         data_loader_test = torch.utils.data.DataLoader(
             dataset_test,
-            sampler=sampler_test,
             batch_size=args.batch_size,
+            shuffle=False,
             num_workers=args.num_workers,
             pin_memory=args.pin_mem,
             drop_last=False,
@@ -718,37 +662,15 @@ def main(args, ds_init):
     skip_weight_decay_list = model.no_weight_decay()
     print("Skip weight decay list: ", skip_weight_decay_list)
 
-    if args.enable_deepspeed:
-        loss_scaler = None
-        optimizer_params = get_parameter_groups(
-            model, args.weight_decay, skip_weight_decay_list,
-            assigner.get_layer_id if assigner is not None else None,
-            assigner.get_scale if assigner is not None else None)
-        model, optimizer, _, _ = ds_init(
-            args=args,
-            model=model,
-            model_parameters=optimizer_params,
-            dist_init_required=not args.distributed,
-        )
-
-        print("model.gradient_accumulation_steps() = %d" %
-              model.gradient_accumulation_steps())
-        assert model.gradient_accumulation_steps() == args.update_freq
-    else:
-        if args.distributed:
-            model = torch.nn.parallel.DistributedDataParallel(
-                model, device_ids=[args.gpu], find_unused_parameters=False)
-            model_without_ddp = model.module
-
-        optimizer = create_optimizer(
-            args,
-            model_without_ddp,
-            skip_list=skip_weight_decay_list,
-            get_num_layer=assigner.get_layer_id
-            if assigner is not None else None,
-            get_layer_scale=assigner.get_scale
-            if assigner is not None else None)
-        loss_scaler = NativeScaler()
+    optimizer = create_optimizer(
+        args,
+        model_without_ddp,
+        skip_list=skip_weight_decay_list,
+        get_num_layer=assigner.get_layer_id
+        if assigner is not None else None,
+        get_layer_scale=assigner.get_scale
+        if assigner is not None else None)
+    loss_scaler = NativeScaler()
 
     print("Use step level LR scheduler!")
     lr_schedule_values = utils.cosine_scheduler(
@@ -793,30 +715,29 @@ def main(args, ds_init):
         exit(0)
 
     if args.eval:
+        if data_loader_test is None:
+            raise RuntimeError('Test dataloader is not initialized.')
         preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
         test_stats = final_test(data_loader_test, model, device, preds_file)
-        torch.distributed.barrier()
-        if global_rank == 0:
-            print("Start merging results...")
-            final_top1, final_top5 = merge(args.output_dir, num_tasks)
-            print(
-                f"Accuracy of the network on the {len(dataset_test)} test videos: Top-1: {final_top1:.2f}%, Top-5: {final_top5:.2f}%"
-            )
-            log_stats = {'Final top-1': final_top1, 'Final Top-5': final_top5}
-            if args.output_dir and utils.is_main_process():
-                with open(
-                        os.path.join(args.output_dir, "log.txt"),
-                        mode="a",
-                        encoding="utf-8") as f:
-                    f.write(json.dumps(log_stats) + "\n")
-        exit(0)
+        print(
+            f"Accuracy of the network on the {len(dataset_test)} test videos: Top-1: {test_stats['acc1']:.2f}%, Top-5: {test_stats['acc5']:.2f}%"
+        )
+        log_stats = {
+            'Final top-1': test_stats['acc1'],
+            'Final Top-5': test_stats['acc5']
+        }
+        if args.output_dir and utils.is_main_process():
+            with open(
+                    os.path.join(args.output_dir, "log.txt"),
+                    mode="a",
+                    encoding="utf-8") as f:
+                f.write(json.dumps(log_stats) + "\n")
+        return
 
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     max_accuracy = 0.0
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
         if log_writer is not None:
             log_writer.set_step(epoch * num_training_steps_per_epoch *
                                 args.update_freq)
@@ -897,13 +818,11 @@ def main(args, ds_init):
                     encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
-    preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
-    test_stats = final_test(data_loader_test, model, device, preds_file)
-    torch.distributed.barrier()
-
-    if global_rank == 0:
-        print("Start merging results...")
-        final_top1, final_top5 = merge(args.output_dir, num_tasks)
+    if data_loader_test is not None:
+        preds_file = os.path.join(args.output_dir, str(global_rank) + '.txt')
+        test_stats = final_test(data_loader_test, model, device, preds_file)
+        final_top1 = test_stats['acc1']
+        final_top5 = test_stats['acc5']
         print(
             f"Accuracy of the network on the {len(dataset_test)} test videos: Top-1: {final_top1:.2f}%, Top-5: {final_top5:.2f}%"
         )
@@ -921,7 +840,7 @@ def main(args, ds_init):
 
 
 if __name__ == '__main__':
-    opts, ds_init = get_args()
+    opts = get_args()
     if opts.output_dir:
         Path(opts.output_dir).mkdir(parents=True, exist_ok=True)
-    main(opts, ds_init)
+    main(opts)

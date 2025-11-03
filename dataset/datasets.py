@@ -59,10 +59,44 @@ class VideoClsDataset(Dataset):
 
         self.video_loader = get_video_loader()
 
-        cleaned = pd.read_csv(self.anno_path, header=None, delimiter=' ')
-        self.dataset_samples = list(
-            cleaned[0].apply(lambda row: os.path.join(self.data_root, row)))
-        self.label_array = list(cleaned.values[:, 1])
+        # Parse CSV file handling spaces in file paths
+        # Format: <file_path> <label>
+        # Split from right: last whitespace-separated token is label, rest is path
+        # This handles file paths that contain spaces
+        dataset_samples = []
+        label_array = []
+        
+        with open(self.anno_path, 'r') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Split from right: find last whitespace-separated token as label
+                # rsplit(None, 1) splits on any whitespace from right, max 1 split
+                parts = line.rsplit(None, 1)
+                
+                if len(parts) == 2:
+                    path, label = parts
+                    try:
+                        label_int = int(label)
+                        dataset_samples.append(os.path.join(self.data_root, path))
+                        label_array.append(label_int)
+                    except ValueError:
+                        print(f"Warning: Skipping line {line_num}, invalid label '{label}' (expected integer)")
+                        continue
+                else:
+                    print(f"Warning: Skipping line {line_num}, expected format '<path> <label>' but got {len(parts)} field(s)")
+                    print(f"  Line content: {line[:100]}...")  # Print first 100 chars for debugging
+                    continue
+        
+        if len(dataset_samples) == 0:
+            raise ValueError(f"No valid samples found in {self.anno_path}. Please check the file format.")
+        
+        print(f"Successfully loaded {len(dataset_samples)} samples from {self.anno_path}")
+        
+        self.dataset_samples = dataset_samples
+        self.label_array = label_array
 
         if (mode == 'train'):
             pass
