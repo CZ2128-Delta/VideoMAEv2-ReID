@@ -127,7 +127,10 @@ def train_one_epoch(model: torch.nn.Module,
 
 
 @torch.no_grad()
-def _gather_features(data_loader, model, device, header):
+def _extract_features(data_loader, model, device, header):
+    if data_loader is None:
+        return None, None
+
     metric_logger = utils.MetricLogger(delimiter="  ")
     features_list = []
     labels_list = []
@@ -149,13 +152,13 @@ def _gather_features(data_loader, model, device, header):
 
 
 @torch.no_grad()
-def validation_one_epoch(data_loader, model, device):
+def validation_one_epoch(query_loader, gallery_loader, model, device):
     model.eval()
-    features, labels = _gather_features(data_loader, model, device, 'Val:')
-    if features is None:
-        return {'rank1': 0.0, 'mAP': 0.0}
-
-    stats = compute_reid_metrics(features, labels)
+    q_features, q_labels = _extract_features(query_loader, model, device,
+                                             'Val Query:')
+    g_features, g_labels = _extract_features(gallery_loader, model, device,
+                                             'Val Gallery:')
+    stats = compute_reid_metrics(q_features, q_labels, g_features, g_labels)
     print(
         '* Rank-1 {:.2f}% Rank-5 {:.2f}% mAP {:.2f}%'.format(
             stats['rank1'] * 100, stats['rank5'] * 100, stats['mAP'] * 100))
@@ -163,13 +166,13 @@ def validation_one_epoch(data_loader, model, device):
 
 
 @torch.no_grad()
-def final_test(data_loader, model, device):
+def final_test(query_loader, gallery_loader, model, device):
     model.eval()
-    features, labels = _gather_features(data_loader, model, device, 'Test:')
-    if features is None:
-        return {'rank1': 0.0, 'mAP': 0.0}
-
-    stats = compute_reid_metrics(features, labels)
+    q_features, q_labels = _extract_features(query_loader, model, device,
+                                             'Test Query:')
+    g_features, g_labels = _extract_features(gallery_loader, model, device,
+                                             'Test Gallery:')
+    stats = compute_reid_metrics(q_features, q_labels, g_features, g_labels)
     print(
         '* Test Rank-1 {:.2f}% Rank-5 {:.2f}% mAP {:.2f}%'.format(
             stats['rank1'] * 100, stats['rank5'] * 100, stats['mAP'] * 100))

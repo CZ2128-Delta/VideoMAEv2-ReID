@@ -2,7 +2,7 @@ import numpy as np
 from scipy.spatial.distance import cdist
 
 
-def evaluate_rank(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50):
+def evaluate_rank(distmat, q_pids, g_pids, max_rank=50):
     num_q, num_g = distmat.shape
     if num_g < max_rank:
         max_rank = num_g
@@ -13,14 +13,7 @@ def evaluate_rank(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50):
     num_valid_q = 0
 
     for q_idx in range(num_q):
-        q_pid = q_pids[q_idx]
-        q_camid = q_camids[q_idx]
-
-        order = indices[q_idx]
-        remove = (g_pids[order] == q_pid) & (g_camids[order] == q_camid)
-        keep = np.invert(remove)
-
-        orig_cmc = matches[q_idx][keep]
+        orig_cmc = matches[q_idx]
         if not np.any(orig_cmc):
             continue
 
@@ -36,7 +29,7 @@ def evaluate_rank(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50):
         all_AP.append(AP)
 
     if num_valid_q == 0:
-        raise RuntimeError('No valid query for evaluation. Please check your data splits.')
+        raise RuntimeError('No valid query for evaluation. Please ensure each identity has at least one gallery sample.')
 
     all_cmc = np.asarray(all_cmc).astype(np.float32)
     all_cmc = all_cmc.sum(0) / num_valid_q
@@ -44,34 +37,20 @@ def evaluate_rank(distmat, q_pids, g_pids, q_camids, g_camids, max_rank=50):
     return all_cmc, mAP
 
 
-def compute_reid_metrics(features, labels):
-    labels = np.asarray(labels)
-    num_samples = labels.shape[0]
-    if num_samples == 0:
-        raise RuntimeError('No features were provided for evaluation.')
+def compute_reid_metrics(query_features,
+                         query_labels,
+                         gallery_features,
+                         gallery_labels):
+    if query_features is None or gallery_features is None:
+        return {'rank1': 0.0, 'rank5': 0.0, 'mAP': 0.0}
+    if len(query_features) == 0 or len(gallery_features) == 0:
+        return {'rank1': 0.0, 'rank5': 0.0, 'mAP': 0.0}
 
-    # group indices by label
-    label_to_indices = {}
-    for idx, label in enumerate(labels):
-        label_to_indices.setdefault(label, []).append(idx)
+    q_labels = np.asarray(query_labels)
+    g_labels = np.asarray(gallery_labels)
 
-    query_indices = []
-    gallery_indices = []
-    for indices in label_to_indices.values():
-        query_indices.append(indices[0])
-        gallery_indices.extend(indices)
-
-    q_features = features[query_indices]
-    g_features = features[gallery_indices]
-
-    q_labels = labels[query_indices]
-    g_labels = labels[gallery_indices]
-
-    q_camids = np.zeros(len(query_indices), dtype=int)
-    g_camids = np.ones(len(gallery_indices), dtype=int)
-
-    distmat = cdist(q_features, g_features, metric='cosine')
-    cmc, mAP = evaluate_rank(distmat, q_labels, g_labels, q_camids, g_camids)
+    distmat = cdist(query_features, gallery_features, metric='cosine')
+    cmc, mAP = evaluate_rank(distmat, q_labels, g_labels)
 
     rank1 = float(cmc[0]) if cmc.size > 0 else 0.0
     rank5_index = min(4, cmc.size - 1) if cmc.size > 0 else 0

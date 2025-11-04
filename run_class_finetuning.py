@@ -12,7 +12,7 @@ import json
 import os
 import random
 import time
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from functools import partial
 from pathlib import Path
 
@@ -39,6 +39,8 @@ from optim_factory import (
 )
 from utils import NativeScalerWithGradNormCount as NativeScaler
 from utils import multiple_samples_collate
+
+from torch.utils.data import Subset
 
 from reid.reid_head import ReIDHead
 from reid.reid_losses import CombinedLoss
@@ -135,6 +137,81 @@ def save_training_curves(output_dir,
     fig.savefig(plot_path)
     plt.close(fig)
     print(f"Saved training curves to {plot_path}")
+
+
+def split_query_gallery_indices(dataset,
+                                min_samples_per_id=2,
+                                query_ratio=0.5):
+    label_array = np.array(dataset.label_array)
+    label_to_indices = defaultdict(list)
+    for idx, label in enumerate(label_array):
+        label_to_indices[label].append(idx)
+
+    query_indices = []
+    gallery_indices = []
+
+    for indices in label_to_indices.values():
+        if len(indices) < min_samples_per_id:
+            gallery_indices.extend(indices)
+            continue
+
+        idx_copy = indices.copy()
+        random.shuffle(idx_copy)
+        num_query = max(1, int(len(idx_copy) * query_ratio))
+        if num_query >= len(idx_copy):
+            num_query = len(idx_copy) - 1
+        if num_query <= 0:
+            # fallback: treat all as gallery
+            gallery_indices.extend(idx_copy)
+            continue
+        query_indices.extend(idx_copy[:num_query])
+        gallery_indices.extend(idx_copy[num_query:])
+
+    # Ensure disjoint sets
+    query_set = set(query_indices)
+    gallery_set = set(gallery_indices)
+    overlap = query_set & gallery_set
+    if overlap:
+        gallery_indices = [idx for idx in gallery_indices if idx not in overlap]
+
+    return query_indices, gallery_indices
+
+
+def build_reid_eval_loaders(dataset,
+                            batch_size,
+                            num_workers,
+                            pin_memory,
+                            persistent_workers,
+                            query_ratio=0.5):
+    query_indices, gallery_indices = split_query_gallery_indices(
+        dataset, query_ratio=query_ratio)
+
+    if len(query_indices) == 0 or len(gallery_indices) == 0:
+        print(
+            'Warning: insufficient samples to create query/gallery splits for evaluation. '
+            'Skipping ReID evaluation for this split.')
+        return None, None, 0, 0
+
+    query_subset = Subset(dataset, query_indices)
+    gallery_subset = Subset(dataset, gallery_indices)
+
+    loader_args = {
+        'batch_size': batch_size,
+        'shuffle': False,
+        'num_workers': num_workers,
+        'pin_memory': pin_memory,
+        'drop_last': False,
+        'persistent_workers': persistent_workers if num_workers > 0 else False
+    }
+
+    query_loader = torch.utils.data.DataLoader(query_subset, **loader_args)
+    gallery_loader = torch.utils.data.DataLoader(gallery_subset, **loader_args)
+
+    print(
+        f"Created query/gallery loaders -> Query: {len(query_indices)} samples, "
+        f"Gallery: {len(gallery_indices)} samples")
+
+    return query_loader, gallery_loader, len(query_indices), len(gallery_indices)
 
 
 def get_args():
@@ -521,28 +598,28 @@ def main(args):
         persistent_workers=True)
 
     if dataset_val is not None:
-        data_loader_val = torch.utils.data.DataLoader(
-            dataset_val,
-            batch_size=int(1.5 * args.batch_size),
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=args.pin_mem,
-            drop_last=False,
-            persistent_workers=True)
+        val_query_loader, val_gallery_loader, num_val_query, num_val_gallery = \
+            build_reid_eval_loaders(
+                dataset_val,
+                batch_size=int(1.5 * args.batch_size),
+                num_workers=args.num_workers,
+                pin_memory=args.pin_mem,
+                persistent_workers=True)
     else:
-        data_loader_val = None
+        val_query_loader = val_gallery_loader = None
+        num_val_query = num_val_gallery = 0
 
     if dataset_test is not None:
-        data_loader_test = torch.utils.data.DataLoader(
-            dataset_test,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=args.num_workers,
-            pin_memory=args.pin_mem,
-            drop_last=False,
-            persistent_workers=True)
+        test_query_loader, test_gallery_loader, num_test_query, num_test_gallery = \
+            build_reid_eval_loaders(
+                dataset_test,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                pin_memory=args.pin_mem,
+                persistent_workers=True)
     else:
-        data_loader_test = None
+        test_query_loader = test_gallery_loader = None
+        num_test_query = num_test_gallery = 0
 
     backbone = create_model(
         args.model,
@@ -810,19 +887,25 @@ def main(args):
         loss_scaler=loss_scaler,
         model_ema=model_ema)
     if args.validation:
-        test_stats = validation_one_epoch(data_loader_val, model, device)
-        print(
-            f"{len(dataset_val)} val samples: Rank-1 {test_stats['rank1'] * 100:.2f}%, "
-            f"Rank-5 {test_stats['rank5'] * 100:.2f}%, mAP {test_stats['mAP'] * 100:.2f}%"
-        )
+        if val_query_loader is None or val_gallery_loader is None:
+            print('Validation requested but query/gallery split is unavailable.')
+        else:
+            test_stats = validation_one_epoch(val_query_loader, val_gallery_loader,
+                                              model, device)
+            print(
+                f"Validation metrics ({num_val_query} query / {num_val_gallery} gallery samples): "
+                f"Rank-1 {test_stats['rank1'] * 100:.2f}%, "
+                f"Rank-5 {test_stats['rank5'] * 100:.2f}%, mAP {test_stats['mAP'] * 100:.2f}%"
+            )
         exit(0)
 
     if args.eval:
-        if data_loader_test is None:
-            raise RuntimeError('Test dataloader is not initialized.')
-        test_stats = final_test(data_loader_test, model, device)
+        if test_query_loader is None or test_gallery_loader is None:
+            raise RuntimeError('Test query/gallery loaders are not initialized.')
+        test_stats = final_test(test_query_loader, test_gallery_loader, model, device)
         print(
-            f"ReID metrics on {len(dataset_test)} test videos: Rank-1 {test_stats['rank1'] * 100:.2f}%, "
+            f"ReID metrics on {num_test_query} query / {num_test_gallery} gallery test videos: "
+            f"Rank-1 {test_stats['rank1'] * 100:.2f}%, "
             f"Rank-5 {test_stats['rank5'] * 100:.2f}%, mAP {test_stats['mAP'] * 100:.2f}%"
         )
         log_stats = {
@@ -884,8 +967,8 @@ def main(args):
                     loss_scaler=loss_scaler,
                     epoch=epoch,
                     model_ema=model_ema)
-        if data_loader_val is not None:
-            test_stats = validation_one_epoch(data_loader_val, model, device)
+        if val_query_loader is not None and val_gallery_loader is not None:
+            test_stats = validation_one_epoch(val_query_loader, val_gallery_loader, model, device)
             current_rank1 = test_stats['rank1'] * 100
             current_rank5 = test_stats['rank5'] * 100
             val_epochs.append(epoch + 1)
@@ -893,8 +976,9 @@ def main(args):
             val_rank5_history.append(test_stats['rank5'])
             val_mAP_history.append(test_stats['mAP'])
             print(
-                f"Metrics on {len(dataset_val)} val samples -> Rank-1 {current_rank1:.2f}%, "
-                f"Rank-5 {current_rank5:.2f}%, mAP {test_stats['mAP'] * 100:.2f}%"
+                f"Metrics on validation split ({num_val_query} query / {num_val_gallery} gallery): "
+                f"Rank-1 {current_rank1:.2f}%, Rank-5 {current_rank5:.2f}%, "
+                f"mAP {test_stats['mAP'] * 100:.2f}%"
             )
             if best_rank1 < current_rank1:
                 best_rank1 = current_rank1
@@ -939,10 +1023,11 @@ def main(args):
                     encoding="utf-8") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
-    if data_loader_test is not None:
-        test_stats = final_test(data_loader_test, model, device)
+    if test_query_loader is not None and test_gallery_loader is not None:
+        test_stats = final_test(test_query_loader, test_gallery_loader, model, device)
         print(
-            f"ReID metrics on the {len(dataset_test)} test videos: Rank-1 {test_stats['rank1'] * 100:.2f}%, "
+            f"ReID metrics on the test split ({num_test_query} query / {num_test_gallery} gallery samples): "
+            f"Rank-1 {test_stats['rank1'] * 100:.2f}%, "
             f"Rank-5 {test_stats['rank5'] * 100:.2f}%, mAP {test_stats['mAP'] * 100:.2f}%"
         )
         log_stats = {
