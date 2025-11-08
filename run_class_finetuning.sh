@@ -18,8 +18,8 @@ DATA_ROOT="/fs/scratch/PAS3184/draft/appearance"
 MODEL_PATH="./model_zoo/vit_b_k710_dl_from_giant.pth"
 OUTPUT_DIR="./output"
 
-module load miniconda3/24.1.2-py310
-conda activate videomae
+# module load miniconda3/24.1.2-py310
+# conda activate videomae
 
 cd /users/PAS2985/cz2128/ReID/VideoMAEv2
 python run_class_finetuning.py \
@@ -40,7 +40,7 @@ python run_class_finetuning.py \
     --opt adamw \
     --lr 2e-4 \
     --warmup_epochs 0 \
-    --epochs 10 \
+    --epochs 100 \
     --reid_embed_dim 512 \
     --reid_neck_feat after \
     --id_loss_weight 1.0 \
